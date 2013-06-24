@@ -1,14 +1,69 @@
-# Public Domain (-) 2013 The Campaign Tweets Authors.
-# See the Campaign Tweets UNLICENSE file for details.
+# Public Domain (-) 2009-2013 The TweetApp Authors.
+# See the TweetApp UNLICENSE file for details.
 
-"""Twitter API Client."""
+"""
+Twitter API Client.
 
-import logging
+To start, initialise a client with the consumer key and
+secret for your app, e.g.
+
+    >>> client = Client(CONSUMER_KEY, CONSUMER_SECRET)
+
+If you already have the access token and secret for a user,
+you can instantiate a subclient with:
+
+    >>> subclient = client.for_auth(token, secret)
+
+You can then make API calls by using dot notation for the
+URL path segments of the Twitter API method and keyword
+arguments for the parameters, e.g.
+
+    >>> subclient.statuses.show(id=123, trim_user=True)
+    <urlfetch.Response object>
+
+    >>> subclient.statuses.update(status="Hello world!")
+    <urlfetch.Response object>
+
+    >>> subclient.friendships.lookup(screen_name="tav")
+    <urlfetch.Response object>
+
+By default the raw ``urlfetch.Response`` object is returned,
+but you can auto-decode JSON responses into Python objects
+by calling the ``json`` method on the response, e.g.
+
+    >>> subclient.friendships.lookup(screen_name="tav").json()
+    [{"name": "tav", "id_str": ...}]
+
+Some internals are exposed for your convenience. By default,
+all requests time out after 20 seconds. You can modify this
+by setting the ``deadline`` attribute on a ``client``:
+
+    >>> client.deadline = 40
+
+Or if you wanted to modify the deadline globally for all
+clients:
+
+    >>> Client.deadline = 40
+
+Do bear in mind that App Engine limits urlfetch requests to
+a maximum of 60 seconds within frontend requests and to 10
+minutes for cron and taskqueue requests.
+
+You can also access the attributes ``authenticate_url`` and
+``authorize_url`` in order to send users to the appropriate
+auth URL on Twitter, e.g.
+
+    >>> url = client.authorize_url + "?oauth_token=" + token
+
+These attributes are also writable. So you can modify them
+should you wish to use an alternative endpoint of some kind.
+
+"""
 
 from binascii import hexlify
 from hashlib import sha1
 from hmac import new as hmac
-from json import loads as decode_json
+from json import loads
 from os import urandom
 from time import time
 from urllib import quote as urlquote, urlencode
@@ -24,30 +79,30 @@ def encode(param):
         param = str(param)
     return urlquote(param, '')
 
-def to_json(resp):
+def decode_json(resp):
     if resp.status_code != 200:
         if resp.status_code == 429:
-            hdrs = resp.headers
+            get = resp.headers.get
             raise RateLimitError(
-                int(hdrs.get('X-Rate-Limit-Limit', 0)),
-                int(hdrs.get('X-Rate-Limit-Remaining', 0)),
-                int(hdrs.get('X-Rate-Limit-Reset', 0)),
+                int(get('X-Rate-Limit-Limit', 0)),
+                int(get('X-Rate-Limit-Remaining', 0)),
+                int(get('X-Rate-Limit-Reset', 0)),
                 )
         raise RequestError(resp)
-    return decode_json(resp.content)
+    return loads(resp.content)
 
 class Client(object):
     """A client for the Twitter API."""
 
-    _deadline = 20.0
+    deadline = 20.0
 
-    _api_base_url = "https://api.twitter.com/1.1/"
-    _access_token_url = "https://api.twitter.com/oauth/access_token"
-    _authenticate_url = "https://api.twitter.com/oauth/authenticate"
-    _authorize_url = "https://api.twitter.com/oauth/authorize"
-    _request_token_url = "https://api.twitter.com/oauth/request_token"
+    api_base_url = "https://api.twitter.com/1.1/"
+    access_token_url = "https://api.twitter.com/oauth/access_token"
+    authenticate_url = "https://api.twitter.com/oauth/authenticate"
+    authorize_url = "https://api.twitter.com/oauth/authorize"
+    request_token_url = "https://api.twitter.com/oauth/request_token"
 
-    _post_methods = frozenset([
+    post_methods = frozenset([
         'account/remove_profile_banner',
         'account/settings',
         'account/update_delivery_device',
@@ -83,23 +138,27 @@ class Client(object):
         'users/report_spam'
         ])
 
-    def __init__(self, key, secret, auth_token=None, auth_secret=None):
-        self._key = key
-        self._secret = secret
-        self._auth_token = token
-        self._auth_secret = secret
+    def __init__(
+        self, consumer_key, consumer_secret, oauth_token=None,
+        oauth_secret=None
+        ):
+        self._key = consumer_key
+        self._secret = consumer_secret
+        self._oauth_token = oauth_token
+        self._oauth_secret = oauth_secret
 
     def __getattr__(self, attr):
         return Proxy(self, attr)
 
     def __call__(self, path, return_rpc=False, **kwargs):
-        return self.call(
-            path, self._auth_token, self._auth_secret, return_rpc, **kwargs
+        return self._call_explicitly(
+            path, self._oauth_token, self._oauth_secret, return_rpc=return_rpc,
+            **kwargs
             )
 
-    def call(       
+    def _call_explicitly(
         self, path, oauth_token=None, oauth_secret=None, oauth_callback=None,
-        return_rpc=False, **kwargs
+        is_post=False, return_rpc=False, **kwargs
         ):
 
         params = {
@@ -119,14 +178,11 @@ class Client(object):
 
         params.update(kwargs)
 
-        if path.startswith('https://'):
-            is_post = True
-        else:
-            path = self._api_base_url + path + ".json"
-            is_post = False
+        if not (path.startswith('https://') or path.startswith('http://')):
+            path = self.api_base_url + path + ".json"
 
         if not is_post:
-            is_post = path in self._post_methods
+            is_post = path in self.post_methods
             if not is_post:
                 spath = path.split('/')
                 npath = ''            
@@ -135,7 +191,7 @@ class Client(object):
                         npath += '/' + spath.pop(0)
                     else:
                         npath = spath.pop(0)
-                    if npath in self._post_methods:
+                    if npath in self.post_methods:
                         is_post = True
                         break
 
@@ -169,22 +225,22 @@ class Client(object):
             payload = None
 
         if return_rpc:
-            rpc = create_rpc(self._deadline)
+            rpc = create_rpc(self.deadline)
             make_fetch_call(
                 rpc, path, payload, meth, headers, validate_certificate=True
                 )
             return rpc
 
         resp = fetch(
-            path, payload, meth, headers, deadline=self._deadline,
+            path, payload, meth, headers, deadline=self.deadline,
             validate_certificate=True
             )
-        resp.json = to_json
+        resp.json = decode_json
         return resp
 
     def get_access_token(self, oauth_token, oauth_secret, oauth_verifier):
-        resp = self.call(
-            self._access_token_url, oauth_token, oauth_secret,
+        resp = self._call_explicitly(
+            self.access_token_url, oauth_token, oauth_secret, is_post=True,
             oauth_verifier=oauth_verifier
             )
         if resp.status_code != 200:
@@ -192,7 +248,10 @@ class Client(object):
         return dict(tuple(param.split('=')) for param in resp.content.split('&'))
 
     def get_request_token(self, oauth_callback):
-        resp = self.call(self._request_token_url, oauth_callback=oauth_callback)
+        resp = self._call_explicitly(
+            self.request_token_url, oauth_callback=oauth_callback,
+            is_post=True
+            )
         if resp.status_code != 200:
             raise RequestError(resp)
         return dict(tuple(param.split('=')) for param in resp.content.split('&'))
@@ -203,14 +262,14 @@ class Client(object):
 class Proxy(object):
     """Access Twitter API methods via dot.notation attribute access."""
 
-    __slots__ = ('_args', '_client', '_path')
+    __slots__ = ('_client', '_path')
 
-    def __init__(self, client, path, *args):
+    def __init__(self, client, path):
         self._client = client
         self._path = path
 
     def __getattr__(self, attr):
-        return Proxy(self._client, self._path + '/' + attr, *self._args)
+        return Proxy(self._client, self._path + '/' + attr)
 
     def __call__(self, *args, **kwargs):
         return self._client(self._path, *args, **kwargs)
