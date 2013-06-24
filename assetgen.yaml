@@ -1,0 +1,21 @@
+# Public Domain (-) 2013 The Campaign Tweets Authors.
+# See the Campaign Tweets UNLICENSE file for details.
+
+generate:
+
+- client.js:
+    source:
+      - coffee/client.coffee
+
+- site.css:
+    source:
+      - sass/site.sass
+
+output.directory: app/build
+output.hashed: true
+output.manifest: app/assets.json
+
+profile.dev:
+  css.compress: false
+  js.compress: false
+  output.hashed: false
