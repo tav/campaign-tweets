@@ -2,37 +2,164 @@
 # See the TweetApp UNLICENSE file for details.
 
 """
-Twitter API Client.
+Twitter API Client for Google App Engine.
 
-To start, initialise a client with the consumer key and
-secret for your app, e.g.
+The client supports both where:
 
-    >>> client = Client(CONSUMER_KEY, CONSUMER_SECRET)
+1. You already have an access token and secret for a user.
 
-If you already have the access token and secret for a user,
-you can instantiate a subclient with:
+2. Or you only have the consumer key and secret for your app
+   and need to get a user to authorize an access token.
 
-    >>> subclient = client.for_auth(token, secret)
+To start, let's look at the first mode. Initialise a client
+with the various keys and secrets, e.g.
+
+    >>> client = Client(
+    ...     consumer_key, consumer_secret,
+    ...     access_token, access_token_secret
+    ...     )
 
 You can then make API calls by using dot notation for the
-URL path segments of the Twitter API method and keyword
-arguments for the parameters, e.g.
+path segments of the API URL and keyword arguments for the
+parameters, e.g.
 
-    >>> subclient.statuses.show(id=123, trim_user=True)
-    <urlfetch.Response object>
+    >>> client.statuses.show(id=123, trim_user='true')
 
-    >>> subclient.statuses.update(status="Hello world!")
-    <urlfetch.Response object>
+    >>> client.statuses.update(status="Hello world!")
 
-    >>> subclient.friendships.lookup(screen_name="tav")
-    <urlfetch.Response object>
+    >>> client.friendships.lookup(screen_name="tav")
 
-By default the raw ``urlfetch.Response`` object is returned,
-but you can auto-decode JSON responses into Python objects
-by calling the ``json`` method on the response, e.g.
+By default the returned objects are ``urlfetch.Response``
+objects. But if you are expecting a JSON response, then you
+can call the ``json`` method on the response to get the
+deserialized Python object, e.g.
+
+    >>> client.friendships.lookup(screen_name="tav").json()
+    [{"name": "tav", "id_str": ...}]
+
+Note: the ``.json()`` is a special method we explicitly add
+to each response object instead of monkey-patching the core
+``urlfetch.Response`` class so as to not interfere with any
+other code.
+
+---------
+User Auth
+---------
+
+If you don't yet have an access token for a user, you need
+to first instantiate a client with just the consumer key and
+secret for your app, e.g.
+
+    >>> client = Client(consumer_key, consumer_secret)
+
+You then need to get a request token from Twitter by calling
+the ``get_request_token`` method:
+
+    >>> req_tok_info = client.get_request_token(
+    ...     "https://www.yourapp.com/callback-url"
+    ...     )
+
+This returns a dictionary object like:
+
+    >>> req_tok_info
+    {'oauth_token': '...', 'oauth_token_secret': '...',
+     'oauth_callback_confirmed': '...'}
+
+You can then save the secret somewhere and redirect the user
+to Twitter's authentication or authorization URL with the
+token as parameter, e.g. assuming your framework provides
+``redirect(url)`` and ``db.set(key, value)`` functions:
+
+    >>> req_token = req_tok_info['oauth_token']
+    >>> req_token_secret = req_tok_info['oauth_token_secret']
+    >>> db.set(req_token, req_token_secret)
+    >>> redirect(
+    ...     client.authorize_url + "?oauth_token=" + req_tok
+    ...     )
+
+Then, assuming that the user approved your app, Twitter
+would redirect back to your callback URL with
+``oauth_token`` and ``oauth_verifier`` query parameters (or
+a ``denied`` parameter if the user hadn't approved).
+
+You can then use the token to retrieve the corresponding
+secret, e.g. assuming your framework has ``url.get(param)``
+function for getting URL query parameters for the request
+and a ``db.get(key)`` function for retrieving stored items
+from the datastore:
+
+    >>> req_token = url.get('oauth_token')
+    >>> req_token_secret = db.get(req_token)
+    >>> req_token_verifier = url.get('oauth_verifier')
+
+Finally, you can ask Twitter to exchange the request token
+for an access token with the ``get_access_token`` method:
+
+    >>> access_token_info = client.get_access_token(
+    ...     req_token, req_token_secret, req_token_verifier
+    ...     )
+
+And assuming everything went well, this should return a
+dictionary like:
+
+    >>> access_tok_info
+    {'oauth_token': '...', 'oauth_token_secret': '...',
+     'user_id': '...', 'screen_name': '...'}
+
+You can then save this info somewhere:
+
+    >>> access_tok = access_tok_info['oauth_token']
+    >>> access_tok_secret = access_tok_info['oauth_token_secret']
+
+And create a "subclient" with the auth info, e.g.
+
+    >>> subclient = client.for_auth(access_tok, access_tok_secret)
+
+And use the subclient as you would a normal client, e.g.
 
     >>> subclient.friendships.lookup(screen_name="tav").json()
     [{"name": "tav", "id_str": ...}]
+
+----------
+Exceptions
+----------
+
+If you had exceeded Twitter's rate limits for your API call,
+then a ``RateLimitExceeded`` exception will be thrown. It
+exposes the ``limit`` and ``reset_time`` (in Unix time) as
+attributes so you can retry later should you want to.
+
+Similarly if Twitter had not responded with a 200 HTTP
+status code, a ``RequestError`` exception will be thrown.
+You can access the raw ``urlfetch.Response`` through the
+``resp`` attribute of this object.
+
+--------------
+Async Requests
+--------------
+
+App Engine supports asynchronous ``urlfetch`` requests. If
+you would like the API calls to be made asynchronously,
+simply specify ``return_rpc=True`` when making specific API
+calls, e.g.
+
+    >>> rpc = client.statuses.home_timeline(return_rpc=True)
+
+This returns an ``RPC`` object and the request would be
+happening in the background. You can then call the
+``get_result()`` method on the ``RPC`` object to get the
+response object.
+
+Note that though the response object would not have had a
+``.json()`` method added to it, you can achieve the same
+behaviour by using the provided ``decode_json`` utility
+function, e.g.
+
+    >>> decode_json(rpc.get_result())
+
+----------------------
+Configurable Internals
+----------------------
 
 Some internals are exposed for your convenience. By default,
 all requests time out after 20 seconds. You can modify this
@@ -83,9 +210,8 @@ def decode_json(resp):
     if resp.status_code != 200:
         if resp.status_code == 429:
             get = resp.headers.get
-            raise RateLimitError(
+            raise RateLimitExceeded(
                 int(get('X-Rate-Limit-Limit', 0)),
-                int(get('X-Rate-Limit-Remaining', 0)),
                 int(get('X-Rate-Limit-Reset', 0)),
                 )
         raise RequestError(resp)
@@ -274,13 +400,12 @@ class Proxy(object):
     def __call__(self, *args, **kwargs):
         return self._client(self._path, *args, **kwargs)
 
-class RateLimitError(Exception):
+class RateLimitExceeded(Exception):
     """Rate Limit reached when making a Twitter API call."""
 
-    def __init__(self, limit, remaining, reset):
+    def __init__(self, limit, reset_time):
         self.limit = limit
-        self.remaining = remaining
-        self.reset = reset
+        self.reset_time = reset_time
 
 class RequestError(Exception):
     """Error making a Twitter API call."""
